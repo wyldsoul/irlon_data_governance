@@ -7,7 +7,8 @@ parameter-level suppression of values in governed public tables.
 generic rejected_observations registry
              |
              +-- SBE37 identity + station mapping + guards/triggers  (implemented pilot)
-             +-- SeaFET identity + station mapping + guards/triggers (future)
+             +-- SeaFET v1 / SUNA v2 / Aquadopp modules              (disposable-test implementation)
+             +-- CO2ProCV module                                     (proposed; production validation required)
              +-- other instrument-specific enforcement modules       (future)
 ```
 
@@ -26,3 +27,8 @@ validation and NULL/QC mutation remain explicit in each instrument/table module.
 `1 = bad`, `2 = suspect`, `3 = good`. The registry stores the applicable
 IRLON QARTOD rollup; it does not define a separate rejection-specific QC
 vocabulary.
+
+For shared physical tables, source identity belongs to the underscore-prefixed
+instrument row and the rejected source parameter—not simply to the `-WQ`
+public row. Every module uses an explicit fixed parameter list; no generic
+trigger performs dynamic arbitrary-column mutation.

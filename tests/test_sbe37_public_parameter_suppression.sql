@@ -10,7 +10,16 @@ CREATE TABLE seabird_sbeeco (
   dissolved_oxygen double precision, qc_dissolved_oxygen integer, specific_conductance double precision, qc_specific_conductance integer,
   UNIQUE (station, m_date));
 CREATE TABLE seabird_sbe37 (station varchar NOT NULL, m_date timestamptz NOT NULL, serial_number_sbe37 varchar, raw_conductivity_hz double precision, UNIQUE(station,m_date));
+CREATE TABLE seabird_seafetv1 (station varchar NOT NULL, m_date timestamptz NOT NULL, serial_number_seafet varchar,
+  ph_tempsal double precision, qc_ph_tempsal integer, ph_int double precision, UNIQUE(station,m_date));
+CREATE TABLE seabird_sunav2 (station varchar NOT NULL, m_date timestamptz NOT NULL, serial_number_suna varchar,
+  nitrate_um double precision, qc_nitrate_um integer, nitrate_mgl double precision, qc_nitrate_mgl integer, UNIQUE(station,m_date));
+CREATE TABLE nortek_aquadopp (station varchar NOT NULL, m_date timestamptz NOT NULL, serial_number_aquadopp varchar,
+  current_speed double precision, qc_current_speed integer, current_direction double precision, qc_current_direction integer, UNIQUE(station,m_date));
 \ir ../sql/sbe37_public_parameter_suppression.sql
+\ir ../sql/seafetv1/public_parameter_suppression.sql
+\ir ../sql/sunav2/public_parameter_suppression.sql
+\ir ../sql/aquadopp/public_parameter_suppression.sql
 
 -- Detect unnecessary public updates caused by ordinary private/raw writes.
 CREATE TABLE public_update_audit (n integer NOT NULL DEFAULT 0);
@@ -303,4 +312,62 @@ SAVEPOINT rejection_rollback;
 SELECT reject_sbe37_public_parameter('_IRL-SB_SBE37','25799','2026-01-01 00:00+00','salinity',1,'rollback','tester');
 ROLLBACK TO rejection_rollback;
 DO $$ BEGIN IF (SELECT count(*) FROM rejected_observations WHERE source_table='seabird_sbe37') <> 1 OR (SELECT salinity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') <> 31 THEN RAISE EXCEPTION 'rollback was partial'; END IF; END $$;
+
+-- Additional modules: source-specific fixed parameter handling, raw preservation,
+-- replay, serial mismatch rejection, and audited reinstatement.
+INSERT INTO seabird_seafetv1 VALUES ('_IRL-SF_SEAFETV1','2026-02-01 00:00+00','SF-1',NULL,NULL,7.9),('IRL-SF-WQ','2026-02-01 00:00+00',NULL,8.1,3,NULL);
+SELECT reject_seafetv1_public_parameter('_IRL-SF_SEAFETV1','SF-1','2026-02-01 00:00+00','ph_tempsal',1,'test','tester');
+DO $$ BEGIN
+ IF (SELECT ph_int FROM seabird_seafetv1 WHERE station='_IRL-SF_SEAFETV1') <> 7.9 THEN RAISE EXCEPTION 'SeaFET raw value changed'; END IF;
+ IF (SELECT ph_tempsal FROM seabird_seafetv1 WHERE station='IRL-SF-WQ') IS NOT NULL OR (SELECT qc_ph_tempsal FROM seabird_seafetv1 WHERE station='IRL-SF-WQ')<>1 THEN RAISE EXCEPTION 'SeaFET rejection failed'; END IF;
+END $$;
+DO $$ DECLARE ok boolean:=false; BEGIN BEGIN PERFORM reject_seafetv1_public_parameter('_IRL-SF_SEAFETV1','SF-1','2026-02-01 00:00+00','ph_ext',1,'test','tester'); ok:=true; EXCEPTION WHEN others THEN NULL; END; IF ok THEN RAISE EXCEPTION 'SeaFET unsupported parameter accepted'; END IF; END $$;
+UPDATE seabird_seafetv1 SET ph_tempsal=8.2,qc_ph_tempsal=3 WHERE station='IRL-SF-WQ' AND m_date='2026-02-01 00:00+00';
+DO $$ BEGIN IF (SELECT ph_tempsal FROM seabird_seafetv1 WHERE station='IRL-SF-WQ') IS NOT NULL THEN RAISE EXCEPTION 'SeaFET guard bypassed'; END IF; END $$;
+
+INSERT INTO seabird_sunav2 VALUES ('_IRL-SF_SUNA','2026-02-01 00:00+00','SU-1',NULL,NULL,NULL,NULL),('IRL-SF-WQ','2026-02-01 00:00+00',NULL,10,3,2,3);
+SELECT reject_sunav2_public_parameter('_IRL-SF_SUNA','SU-1','2026-02-01 00:00+00','nitrate_um',2,'test','tester');
+UPDATE seabird_sunav2 SET nitrate_um=11,qc_nitrate_um=3,nitrate_mgl=2.1 WHERE station='IRL-SF-WQ' AND m_date='2026-02-01 00:00+00';
+DO $$ BEGIN IF (SELECT nitrate_um FROM seabird_sunav2 WHERE station='IRL-SF-WQ') IS NOT NULL OR (SELECT qc_nitrate_um FROM seabird_sunav2 WHERE station='IRL-SF-WQ')<>2 OR (SELECT nitrate_mgl FROM seabird_sunav2 WHERE station='IRL-SF-WQ')<>2.1 THEN RAISE EXCEPTION 'SUNA fixed-parameter guard failed'; END IF; END $$;
+DO $$ DECLARE ok boolean:=false; BEGIN BEGIN PERFORM reject_sunav2_public_parameter('_IRL-SF_SUNA','fabricated','2026-02-01 00:00+00','nitrate_mgl',3,'test','tester'); ok:=true; EXCEPTION WHEN others THEN NULL; END; IF ok THEN RAISE EXCEPTION 'SUNA fabricated serial accepted'; END IF; END $$;
+DO $$ DECLARE ok boolean:=false; BEGIN BEGIN PERFORM reject_sunav2_public_parameter('_IRL-SF_SUNA','SU-1','2026-02-01 00:00+00','fit_rmse',1,'test','tester'); ok:=true; EXCEPTION WHEN others THEN NULL; END; IF ok THEN RAISE EXCEPTION 'SUNA unsupported parameter accepted'; END IF; END $$;
+
+-- SUNA's real writer uses separate autocommit statements: private first, then
+-- public.  The guard derives identity from the committed private row; no GUC or
+-- other session context is set, so there is nothing to leak into later writes.
+INSERT INTO seabird_sunav2 VALUES ('_IRL-AUTO_SUNA','2026-02-02 00:00+00','SU-AUTO',NULL,NULL,NULL,NULL);
+SELECT reject_sunav2_public_parameter('_IRL-AUTO_SUNA','SU-AUTO','2026-02-02 00:00+00','nitrate_mgl',1,'autocommit writer proof','tester');
+COMMIT;
+BEGIN;
+SET LOCAL search_path TO sbe37_suppression_test;
+INSERT INTO seabird_sunav2 VALUES ('IRL-AUTO-WQ','2026-02-02 00:00+00',NULL,12,3,2.4,3);
+DO $$ BEGIN
+ IF (SELECT nitrate_um FROM seabird_sunav2 WHERE station='IRL-AUTO-WQ') <> 12
+    OR (SELECT nitrate_mgl FROM seabird_sunav2 WHERE station='IRL-AUTO-WQ') IS NOT NULL
+    OR (SELECT qc_nitrate_mgl FROM seabird_sunav2 WHERE station='IRL-AUTO-WQ') <> 1
+ THEN RAISE EXCEPTION 'SUNA private-first autocommit guard proof failed'; END IF;
+ IF sunav2_count_active_rejections('_IRL-AUTO_SUNA','SU-AUTO','2026-02-02 00:00+00') <> 1
+ THEN RAISE EXCEPTION 'SUNA suppression reporting count failed'; END IF;
+END $$;
+-- An unrelated public write remains normal: there is no session identity state.
+INSERT INTO seabird_sunav2 VALUES ('IRL-OTHER-WQ','2026-02-02 00:00+00',NULL,13,3,2.5,3);
+DO $$ BEGIN IF (SELECT nitrate_mgl FROM seabird_sunav2 WHERE station='IRL-OTHER-WQ') <> 2.5 THEN RAISE EXCEPTION 'SUNA identity leaked to unrelated public write'; END IF; END $$;
+SAVEPOINT sunav2_writer_atomicity;
+INSERT INTO seabird_sunav2 VALUES ('_IRL-ROLL_SUNA','2026-02-03 00:00+00','SU-ROLL',NULL,NULL,NULL,NULL);
+ROLLBACK TO sunav2_writer_atomicity;
+DO $$ BEGIN IF EXISTS (SELECT 1 FROM seabird_sunav2 WHERE station='_IRL-ROLL_SUNA') THEN RAISE EXCEPTION 'SUNA writer transaction rollback was partial'; END IF; END $$;
+
+INSERT INTO nortek_aquadopp VALUES ('_IRL-SF_AQUADOPP','2026-02-01 00:00+00','AQ-1',NULL,NULL,NULL,NULL),('IRL-SF-WQ','2026-02-01 00:00+00',NULL,1,3,90,3);
+SELECT reject_aquadopp_public_parameter('_IRL-SF_AQUADOPP','AQ-1','2026-02-01 00:00+00','current_speed',3,'test','tester');
+UPDATE nortek_aquadopp SET current_speed=2,qc_current_speed=1,current_direction=91 WHERE station='IRL-SF-WQ' AND m_date='2026-02-01 00:00+00';
+DO $$ BEGIN IF (SELECT current_speed FROM nortek_aquadopp WHERE station='IRL-SF-WQ') IS NOT NULL OR (SELECT qc_current_speed FROM nortek_aquadopp WHERE station='IRL-SF-WQ')<>3 OR (SELECT current_direction FROM nortek_aquadopp WHERE station='IRL-SF-WQ')<>91 THEN RAISE EXCEPTION 'Aquadopp fixed-parameter guard failed'; END IF; END $$;
+SELECT reinstate_aquadopp_public_parameter('_IRL-SF_AQUADOPP','AQ-1','2026-02-01 00:00+00','current_speed','reviewer');
+UPDATE nortek_aquadopp SET current_speed=2 WHERE station='IRL-SF-WQ' AND m_date='2026-02-01 00:00+00';
+DO $$ BEGIN IF (SELECT current_speed FROM nortek_aquadopp WHERE station='IRL-SF-WQ')<>2 THEN RAISE EXCEPTION 'Aquadopp reinstatement failed'; END IF; END $$;
+DO $$ DECLARE ok boolean:=false; BEGIN BEGIN PERFORM reject_aquadopp_public_parameter('_IRL-SF_AQUADOPP','AQ-1','2026-02-01 00:00+00','current_east',1,'test','tester'); ok:=true; EXCEPTION WHEN others THEN NULL; END; IF ok THEN RAISE EXCEPTION 'Aquadopp unsupported parameter accepted'; END IF; END $$;
+
+-- SeaFET's bounded, two-sided recovery accepts an otherwise blank source serial
+-- only when both adjacent source observations agree.
+INSERT INTO seabird_seafetv1 VALUES ('_IRL-GAP_SEAFETV1','2026-02-01 00:00+00','GAP-1',NULL,NULL,7),('_IRL-GAP_SEAFETV1','2026-02-01 01:00+00',NULL,NULL,NULL,7),('_IRL-GAP_SEAFETV1','2026-02-01 02:00+00','GAP-1',NULL,NULL,7),('IRL-GAP-WQ','2026-02-01 01:00+00',NULL,8,3,NULL);
+DO $$ BEGIN IF seafetv1_resolve_serial('_IRL-GAP_SEAFETV1','2026-02-01 01:00+00') <> 'GAP-1' THEN RAISE EXCEPTION 'SeaFET bounded serial recovery failed'; END IF; END $$;
 ROLLBACK;

@@ -24,9 +24,10 @@ or deployment history before a rejection is recorded; otherwise processing must
 fail closed rather than create a serial-less identity.
 
 The central `rejected_observations` registry is designed for all governed IRLON
-public tables. Each instrument/table family supplies its own reviewed identity,
-mapping, and enforcement functions; this repository does not yet implement
-enforcement for SeaFET, SUNA, Aquadopp, Cycle, PCO2, or other families.
+public tables. SBE37, SeaFET v1, SUNA v2, and Nortek Aquadopp have reviewed
+non-production modules. ECO and CO2ProCV remain proposed pending production-only
+writer and conflict-key validation. Cycle, WQMx, Turner C3, and meteorological
+families are not in scope.
 
 ## Repository layout
 
