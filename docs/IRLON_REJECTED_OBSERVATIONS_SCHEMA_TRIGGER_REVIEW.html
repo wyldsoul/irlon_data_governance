@@ -49,8 +49,8 @@
 <main>
   <header>
     <h1>IRLON Rejected Observations<br>Schema &amp; Trigger Architecture Review</h1>
-    <p class="subtitle">Technical/design review of a generic public-parameter rejection registry and its first concrete SBE37 enforcement module.</p>
-    <span class="badge">Pilot / design review — not deployed to production</span>
+    <p class="subtitle">Technical/design review of the generic registry and source-specific enforcement modules for active IRLON instrument families.</p>
+    <span class="badge">Non-production implementation review — not deployed to production</span>
   </header>
 
   <section class="lead">
@@ -113,16 +113,53 @@ WHERE active;</pre>
       <div class="arrow">→</div>
       <div class="modules">
         <div class="module implemented"><strong>SBE37 identity, mapping, and triggers</strong><span class="tag live">implemented pilot</span></div>
-        <div class="module">SeaFET enforcement module <span class="tag">future</span></div>
-        <div class="module">SUNA enforcement module <span class="tag">future</span></div>
-        <div class="module">Other public-table enforcement modules <span class="tag">future</span></div>
+        <div class="module implemented"><strong>SeaFET v1</strong> — <code>ph_tempsal</code><span class="tag live">implemented + disposable tested</span></div>
+        <div class="module implemented"><strong>SUNA v2</strong> — <code>nitrate_um</code>, <code>nitrate_mgl</code><span class="tag live">implemented + disposable tested</span></div>
+        <div class="module implemented"><strong>Nortek Aquadopp</strong> — <code>current_speed</code>, <code>current_direction</code><span class="tag live">implemented + disposable tested</span></div>
+        <div class="module"><strong>Sea-Bird ECO</strong> — real-time path traced; manual adapter needs manifest + source identity<span class="tag">manual-upload design</span></div>
+        <div class="module"><strong>CO2ProCV</strong> — real-time path traced; manual adapter needs manifest + source identity<span class="tag">manual-upload design</span></div>
       </div>
     </div>
-    <p>Enforcement remains instrument/table-specific because source identity, private→public station mapping, valid public parameters, and replay/write behavior differ. The shared registry avoids repeating rejection/audit storage, while the implementation avoids one giant dynamic trigger that mutates arbitrary public columns.</p>
+    <p>Enforcement remains instrument/table-specific because source identity, private→public station mapping, valid public parameters, and replay/write behavior differ. Rejection identity belongs to the <strong>source parameter</strong>, not to a merged public row as a whole. The shared registry avoids repeating rejection/audit storage, while the implementation avoids one giant dynamic trigger that mutates arbitrary public columns.</p>
   </section>
 
   <section>
-    <h2>5. Current SBE37 trigger example</h2>
+    <h2>5. Current source-identity status</h2>
+    <table>
+      <thead><tr><th>Family</th><th>Source → public identity</th><th>Serial behavior / status</th></tr></thead>
+      <tbody>
+        <tr><td>SBE37</td><td><code>seabird_sbe37</code> → <code>seabird_sbeeco</code>; <code>_SITE_SBE37</code> → <code>SITE-WQ</code></td><td>Source serial is required. Implemented pilot.</td></tr>
+        <tr><td>SeaFET v1</td><td><code>seabird_seafetv1</code>; <code>_SITE_SEAFETV1</code> → <code>SITE-WQ</code></td><td>Exact serial, or agreeing nearest source serials on both sides within 24 hours. Implemented + disposable tested.</td></tr>
+        <tr><td>SUNA v2</td><td><code>seabird_sunav2</code>; <code>_SITE_SUNA</code> → <code>SITE-WQ</code></td><td>Exact source serial required. Implemented + disposable tested.</td></tr>
+        <tr><td>Aquadopp</td><td><code>nortek_aquadopp</code>; <code>_SITE_AQUADOPP</code> → <code>SITE-WQ</code></td><td>Exact source serial required. Implemented + disposable tested.</td></tr>
+        <tr><td>Sea-Bird ECO</td><td><code>seabird_eco</code> → merged <code>seabird_sbeeco</code>; <code>_SITE_ECO</code> → <code>SITE-WQ</code></td><td>Real-time path remains unchanged. Legacy manual Q script loses the serial before hourly averaging; a future manual adapter must retain serial + manifest identity and fail on ambiguous matches.</td></tr>
+        <tr><td>CO2ProCV</td><td><code>prooceanus_co2procv</code>; <code>_SITE_CO2PROCV</code> → <code>SITE-WQ</code></td><td>Real-time path remains unchanged. Legacy manual Q script groups by serial, but joins existing rows only by timestamp/station; a future manual adapter must retain manifest identity and fail on ambiguous matches.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>6. SeaFET, SUNA, and Aquadopp trigger readiness</h2>
+    <div class="grid">
+      <article class="card">
+        <h3>Implemented local trigger pattern</h3>
+        <p>Each module has a <strong>BEFORE public-write guard</strong> and an <strong>AFTER private-write replay trigger</strong>. Both use fixed, source-owned parameter lists and return immediately when no active rejection exists.</p>
+        <p>SeaFET suppresses <code>ph_tempsal</code>; SUNA suppresses <code>nitrate_um</code> or <code>nitrate_mgl</code>; Aquadopp suppresses <code>current_speed</code> or <code>current_direction</code>.</p>
+      </article>
+      <article class="card">
+        <h3>Staging hold points</h3>
+        <p>SUNA already writes the private row first. SeaFET and Aquadopp currently write public data first; their writers must become private-first before production trigger activation.</p>
+        <p>Run the complete disposable PostgreSQL 12 suite and then validate archive-trigger effects on a restored-production clone. No production deployment or writer edit is authorized by this review.</p>
+      </article>
+    </div>
+    <div class="qc" style="margin-top:14px">
+      <strong>Current local verification</strong><br>
+      PostgreSQL 12 disposable regression passed for SBE37, SeaFET, SUNA, and Aquadopp. It covers QARTOD values, fixed parameter validation, replay prevention, fabricated-serial rejection, reinstatement, rollback, and SeaFET's bounded two-sided serial recovery.
+    </div>
+  </section>
+
+  <section>
+    <h2>7. Current SBE37 trigger example</h2>
     <div class="grid">
       <article class="card">
         <h3>Public write guard</h3>
@@ -140,7 +177,7 @@ WHERE active;</pre>
   </section>
 
   <section>
-    <h2>6. Supporting SBE37 functions</h2>
+    <h2>8. Supporting SBE37 functions</h2>
     <div class="panel">
       <p><code>sbe37_public_station()</code> — private-to-public station mapping &nbsp; · &nbsp; <code>sbe37_set_public_write_identity()</code> — transaction-local identity context</p>
       <p><code>sbe37_count_active_rejections()</code> — reporting lookup &nbsp; · &nbsp; <code>sbe37_apply_active_rejections()</code> — explicit NULL/QC application</p>
@@ -149,19 +186,19 @@ WHERE active;</pre>
   </section>
 
   <section>
-    <h2>7. Questions for colleague confirmation</h2>
+    <h2>9. Questions for colleague confirmation</h2>
     <div class="questions">
       <ol>
         <li>Does the generic registry have the correct identity and audit fields for use across IRLON public tables?</li>
         <li>Does the serial-inclusive active-uniqueness model make sense for every active instrument?</li>
         <li>Do you agree that <code>qc_flag</code> uses the established IRLON QARTOD vocabulary: 1 = bad, 2 = suspect, 3 = good?</li>
         <li>Do you agree with one generic registry plus instrument/table-specific enforcement triggers?</li>
-        <li>Are there fields or constraints to change before additional enforcement modules are implemented?</li>
+        <li>Do the proposed ECO and CO2ProCV validations identify the right prerequisites before trigger implementation?</li>
       </ol>
     </div>
   </section>
 
-  <p class="foot">Scope: schema and trigger architecture review only. This document does not describe production deployment, writer integration steps, or enforcement for instruments other than the SBE37 pilot.</p>
+  <p class="foot">Scope: non-production schema and trigger architecture review only. No production deployment or writer changes are described or authorized. Cycle, WQMx, Turner C3, and meteorological enforcement remain out of scope.</p>
 </main>
 </body>
 </html>
