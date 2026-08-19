@@ -1,5 +1,6 @@
--- SBE37 public-parameter rejection pilot.  REVIEW ONLY: do not run against
--- production without an approved deployment plan and a tested writer context.
+-- Generic IRLON public-parameter rejection registry plus the SBE37 pilot
+-- enforcement module. REVIEW ONLY: do not run against production without an
+-- approved deployment plan and a tested writer context.
 --
 -- This script deliberately leaves seabird_sbe37 (private/raw) unchanged.
 -- It is written unqualified so the accompanying test can run it in a
@@ -7,19 +8,16 @@
 
 CREATE TABLE rejected_observations (
     rejection_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    source_table varchar(50) NOT NULL DEFAULT 'seabird_sbe37'
-        CHECK (source_table = 'seabird_sbe37'),
-    public_table varchar(50) NOT NULL DEFAULT 'seabird_sbeeco'
-        CHECK (public_table = 'seabird_sbeeco'),
+    source_table varchar(100) NOT NULL,
+    public_table varchar(100) NOT NULL,
     source_station varchar NOT NULL,
     public_station varchar NOT NULL,
-    serial_number_sbe37 varchar NOT NULL,
+    instrument_type varchar(50) NOT NULL,
+    instrument_serial varchar NOT NULL,
     m_date timestamp with time zone NOT NULL,
-    public_parameter varchar(50) NOT NULL CHECK (public_parameter IN
-        ('conductivity', 'salinity', 'temperature_water', 'pressure_water',
-         'depth_instrument', 'oxygen_saturation_perc', 'dissolved_oxygen',
-         'specific_conductance')),
-    qc_flag integer NOT NULL CHECK (qc_flag IN (1, 2)),
+    public_parameter varchar(100) NOT NULL,
+    -- IRLON QARTOD rollup: 1 = bad, 2 = suspect, 3 = good.
+    qc_flag integer NOT NULL CHECK (qc_flag IN (1, 2, 3)),
     rejection_reason varchar(250) NOT NULL,
     rejected_at timestamp with time zone NOT NULL DEFAULT now(),
     rejected_by varchar(50) NOT NULL DEFAULT current_user,
@@ -32,9 +30,13 @@ CREATE TABLE rejected_observations (
         OR (NOT active AND reinstated_at IS NOT NULL AND reinstated_by IS NOT NULL AND reinstatement_reason IS NOT NULL))
 );
 
-CREATE UNIQUE INDEX rejected_observations_active_sbe37_parameter_key
+-- Every active instrument has a serial identity.  A source row with a missing
+-- serial must be resolved from an approved source/history or fail closed; it
+-- does not create a second, serial-less rejection identity.
+CREATE UNIQUE INDEX rejected_observations_active_parameter_key
     ON rejected_observations
-       (source_table, source_station, serial_number_sbe37, m_date, public_parameter)
+       (source_table, public_table, source_station, public_station,
+        instrument_type, instrument_serial, m_date, public_parameter)
     WHERE active;
 
 -- Maps the actual private naming convention, e.g. _IRL-SB_SBE37 -> IRL-SB-WQ.
@@ -64,8 +66,10 @@ CREATE FUNCTION sbe37_count_active_rejections(
 RETURNS integer LANGUAGE sql STABLE AS $$
     SELECT count(*)::integer
       FROM rejected_observations
-     WHERE active AND source_station = p_source_station
-       AND serial_number_sbe37 = p_serial_number_sbe37 AND m_date = p_m_date
+     WHERE active AND source_table = 'seabird_sbe37'
+       AND public_table = 'seabird_sbeeco' AND instrument_type = 'SBE37'
+       AND source_station = p_source_station
+       AND instrument_serial = p_serial_number_sbe37 AND m_date = p_m_date
 $$;
 
 -- Applies every matching active decision to a public row.  The fixed CASE is
@@ -111,8 +115,10 @@ BEGIN
                  bool_or(public_parameter = 'dissolved_oxygen') AS dissolved_oxygen, max(qc_flag) FILTER (WHERE public_parameter = 'dissolved_oxygen') AS dissolved_oxygen_qc,
                  bool_or(public_parameter = 'specific_conductance') AS specific_conductance, max(qc_flag) FILTER (WHERE public_parameter = 'specific_conductance') AS specific_conductance_qc
             FROM rejected_observations
-           WHERE active AND source_station = p_source_station
-             AND serial_number_sbe37 = p_serial_number_sbe37 AND m_date = p_m_date
+           WHERE active AND source_table = 'seabird_sbe37'
+             AND public_table = 'seabird_sbeeco' AND instrument_type = 'SBE37'
+             AND source_station = p_source_station
+             AND instrument_serial = p_serial_number_sbe37 AND m_date = p_m_date
       ) AS r
      WHERE p.station = sbe37_public_station(p_source_station) AND p.m_date = p_m_date;
     GET DIAGNOSTICS v_count = ROW_COUNT;
@@ -135,9 +141,11 @@ BEGIN
         RAISE EXCEPTION 'private SBE37 identity not found: % / % / %', p_source_station, p_serial_number_sbe37, p_m_date;
     END IF;
     INSERT INTO rejected_observations
-        (source_station, public_station, serial_number_sbe37, m_date, public_parameter,
-         qc_flag, rejection_reason, rejected_by, source_query_or_script)
-    VALUES (p_source_station, sbe37_public_station(p_source_station), p_serial_number_sbe37,
+        (source_table, public_table, source_station, public_station, instrument_type,
+         instrument_serial, m_date, public_parameter, qc_flag, rejection_reason,
+         rejected_by, source_query_or_script)
+    VALUES ('seabird_sbe37', 'seabird_sbeeco', p_source_station,
+            sbe37_public_station(p_source_station), 'SBE37', p_serial_number_sbe37,
             p_m_date, p_public_parameter, p_qc_flag, p_rejection_reason, p_rejected_by,
             p_source_query_or_script)
     RETURNING rejection_id INTO v_rejection_id;
@@ -171,6 +179,8 @@ DECLARE v_source_station varchar := NULLIF(current_setting('irlon.sbe37_source_s
 BEGIN
     IF NEW.instrument IS DISTINCT FROM 'SBE37/ECO' THEN RETURN NEW; END IF;
     IF NOT EXISTS (SELECT 1 FROM rejected_observations ro WHERE ro.active
+                   AND ro.source_table = 'seabird_sbe37'
+                   AND ro.public_table = 'seabird_sbeeco' AND ro.instrument_type = 'SBE37'
                    AND ro.public_station = NEW.station AND ro.m_date = NEW.m_date) THEN RETURN NEW; END IF;
     IF v_source_station IS NULL OR v_serial IS NULL THEN
         RAISE EXCEPTION 'SBE37 public write at an active rejection requires sbe37_set_public_write_identity()';
@@ -189,8 +199,10 @@ BEGIN
             v_source_station, v_serial, NEW.m_date;
     END IF;
     FOR r IN SELECT public_parameter, qc_flag FROM rejected_observations
-              WHERE active AND source_station = v_source_station
-                AND serial_number_sbe37 = v_serial AND m_date = NEW.m_date
+              WHERE active AND source_table = 'seabird_sbe37'
+                AND public_table = 'seabird_sbeeco' AND instrument_type = 'SBE37'
+                AND source_station = v_source_station
+                AND instrument_serial = v_serial AND m_date = NEW.m_date
     LOOP
         CASE r.public_parameter
           WHEN 'conductivity' THEN NEW.conductivity := NULL; NEW.qc_conductivity := r.qc_flag;

@@ -38,6 +38,128 @@ DO $$ BEGIN
  IF sbe37_count_active_rejections('_IRL-SB_SBE37','25799','2026-01-01 00:00+00') <> 1 THEN RAISE EXCEPTION 'suppression reporting count failed'; END IF;
 END $$;
 
+-- The generic registry enforces active uniqueness for serial-bearing sources.
+DO $$ DECLARE v_inserted boolean := false; BEGIN
+ BEGIN
+   INSERT INTO rejected_observations
+     (source_table,public_table,source_station,public_station,instrument_type,
+      instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
+   VALUES
+     ('seabird_sbe37','seabird_sbeeco','_IRL-SB_SBE37','IRL-SB-WQ','SBE37',
+      '25799','2026-01-01 00:00+00','conductivity',2,'duplicate test','tester');
+   v_inserted := true;
+ EXCEPTION WHEN unique_violation THEN NULL;
+ END;
+ IF v_inserted THEN RAISE EXCEPTION 'active serial rejection duplicate was accepted'; END IF;
+END $$;
+
+-- The generic registry needs no SBE37-specific schema values or parameter list,
+-- but every active instrument identity carries its serial number.
+INSERT INTO rejected_observations
+  (source_table,public_table,source_station,public_station,instrument_type,
+   instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
+VALUES
+  ('hypothetical_source','hypothetical_public','IRL-HYP-SRC','IRL-HYP-PUB',
+   'Hypothetical','HYP-001','2026-01-01 00:00+00','hypothetical_parameter',2,
+   'generic serial identity test','tester');
+DO $$ DECLARE v_inserted boolean := false; BEGIN
+ BEGIN
+   INSERT INTO rejected_observations
+     (source_table,public_table,source_station,public_station,instrument_type,
+      instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
+   VALUES
+     ('hypothetical_source','hypothetical_public','IRL-HYP-SRC','IRL-HYP-PUB',
+      'Hypothetical','HYP-001','2026-01-01 00:00+00','hypothetical_parameter',2,
+      'duplicate generic serial identity test','tester');
+   v_inserted := true;
+ EXCEPTION WHEN unique_violation THEN NULL;
+ END;
+ IF v_inserted THEN RAISE EXCEPTION 'active serial rejection duplicate was accepted'; END IF;
+END $$;
+UPDATE rejected_observations
+   SET active=false, reinstated_at=now(), reinstated_by='reviewer', reinstatement_reason='uniqueness test'
+ WHERE source_table='hypothetical_source' AND active;
+INSERT INTO rejected_observations
+  (source_table,public_table,source_station,public_station,instrument_type,
+   instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
+VALUES
+  ('hypothetical_source','hypothetical_public','IRL-HYP-SRC','IRL-HYP-PUB',
+   'Hypothetical','HYP-001','2026-01-01 00:00+00','hypothetical_parameter',1,
+   'later active generic serial identity test','tester');
+DO $$ BEGIN
+ IF (SELECT count(*) FROM rejected_observations WHERE source_table='hypothetical_source' AND active) <> 1 THEN
+   RAISE EXCEPTION 'inactive serial rejection blocked later active rejection';
+ END IF;
+END $$;
+
+-- A source row without its serial is incomplete; it cannot create a separate,
+-- serial-less rejection identity.
+DO $$ DECLARE v_inserted boolean := false; BEGIN
+ BEGIN
+   INSERT INTO rejected_observations
+     (source_table,public_table,source_station,public_station,instrument_type,
+      instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
+   VALUES
+     ('missing_serial_fixture','fixture_public','IRL-MISS-SRC','IRL-MISS-PUB',
+      'Fixture',NULL,'2026-01-01 00:00+00','fixture_parameter',2,
+      'missing serial test','tester');
+   v_inserted := true;
+ EXCEPTION WHEN not_null_violation THEN NULL;
+ END;
+ IF v_inserted THEN RAISE EXCEPTION 'missing instrument serial was accepted'; END IF;
+END $$;
+
+-- qc_flag is the established IRLON QARTOD rollup, not a rejection category:
+-- 1 = bad, 2 = suspect, 3 = good. All three values are accepted.
+INSERT INTO rejected_observations
+  (source_table,public_table,source_station,public_station,instrument_type,
+   instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
+VALUES
+  ('qartod_fixture','qartod_public','IRL-QC-SRC','IRL-QC-PUB','QARTOD fixture',
+   'QARTOD-001','2026-01-01 00:00+00','flag_bad',1,'QARTOD bad test','tester'),
+  ('qartod_fixture','qartod_public','IRL-QC-SRC','IRL-QC-PUB','QARTOD fixture',
+   'QARTOD-001','2026-01-01 00:00+00','flag_suspect',2,'QARTOD suspect test','tester'),
+  ('qartod_fixture','qartod_public','IRL-QC-SRC','IRL-QC-PUB','QARTOD fixture',
+   'QARTOD-001','2026-01-01 00:00+00','flag_good',3,'QARTOD good test','tester');
+DO $$ BEGIN
+ IF (SELECT count(*) FROM rejected_observations WHERE source_table='qartod_fixture' AND qc_flag IN (1,2,3)) <> 3 THEN
+   RAISE EXCEPTION 'valid QARTOD rollup values were not all accepted';
+ END IF;
+END $$;
+
+-- Values outside the established vocabulary, and NULL, are rejected by the
+-- registry constraints.
+DO $$ DECLARE v_inserted boolean := false; BEGIN
+ BEGIN
+   INSERT INTO rejected_observations
+     (source_table,public_table,source_station,public_station,instrument_type,instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
+   VALUES ('qartod_invalid','qartod_public','IRL-QC-SRC','IRL-QC-PUB','QARTOD fixture','QARTOD-INVALID','2026-01-01 00:00+00','flag_zero',0,'invalid QARTOD test','tester');
+   v_inserted := true;
+ EXCEPTION WHEN check_violation THEN NULL;
+ END;
+ IF v_inserted THEN RAISE EXCEPTION 'qc_flag 0 was accepted'; END IF;
+END $$;
+DO $$ DECLARE v_inserted boolean := false; BEGIN
+ BEGIN
+   INSERT INTO rejected_observations
+     (source_table,public_table,source_station,public_station,instrument_type,instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
+   VALUES ('qartod_invalid','qartod_public','IRL-QC-SRC','IRL-QC-PUB','QARTOD fixture','QARTOD-INVALID','2026-01-01 00:00+00','flag_four',4,'invalid QARTOD test','tester');
+   v_inserted := true;
+ EXCEPTION WHEN check_violation THEN NULL;
+ END;
+ IF v_inserted THEN RAISE EXCEPTION 'qc_flag 4 was accepted'; END IF;
+END $$;
+DO $$ DECLARE v_inserted boolean := false; BEGIN
+ BEGIN
+   INSERT INTO rejected_observations
+     (source_table,public_table,source_station,public_station,instrument_type,instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
+   VALUES ('qartod_invalid','qartod_public','IRL-QC-SRC','IRL-QC-PUB','QARTOD fixture','QARTOD-INVALID','2026-01-01 00:00+00','flag_null',NULL,'invalid QARTOD test','tester');
+   v_inserted := true;
+ EXCEPTION WHEN not_null_violation THEN NULL;
+ END;
+ IF v_inserted THEN RAISE EXCEPTION 'qc_flag NULL was accepted'; END IF;
+END $$;
+
 -- A public-only/manual SQL attempt with no private identity fails closed.
 RESET irlon.sbe37_source_station;
 RESET irlon.sbe37_serial_number;
@@ -171,14 +293,14 @@ DO $$ DECLARE v_before double precision; v_allowed boolean := false; BEGIN
 END $$;
 
 -- Reinstatement is audited and permits a future write; it does not reconstruct history.
-SELECT reinstate_sbe37_public_parameter((SELECT rejection_id FROM rejected_observations),'reviewer','validated correction');
+SELECT reinstate_sbe37_public_parameter((SELECT rejection_id FROM rejected_observations WHERE source_table='seabird_sbe37'),'reviewer','validated correction');
 SELECT sbe37_set_public_write_identity('_IRL-SB_SBE37','25799');
 UPDATE seabird_sbeeco SET conductivity=6 WHERE station='IRL-SB-WQ' AND m_date='2026-01-01 00:00+00';
-DO $$ BEGIN IF (SELECT conductivity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') <> 6 OR (SELECT active FROM rejected_observations) THEN RAISE EXCEPTION 'reinstatement failed'; END IF; END $$;
+DO $$ BEGIN IF (SELECT conductivity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') <> 6 OR (SELECT active FROM rejected_observations WHERE source_table='seabird_sbe37') THEN RAISE EXCEPTION 'reinstatement failed'; END IF; END $$;
 
 -- The rejection API is atomic under rollback.
 SAVEPOINT rejection_rollback;
 SELECT reject_sbe37_public_parameter('_IRL-SB_SBE37','25799','2026-01-01 00:00+00','salinity',1,'rollback','tester');
 ROLLBACK TO rejection_rollback;
-DO $$ BEGIN IF (SELECT count(*) FROM rejected_observations) <> 1 OR (SELECT salinity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') <> 31 THEN RAISE EXCEPTION 'rollback was partial'; END IF; END $$;
+DO $$ BEGIN IF (SELECT count(*) FROM rejected_observations WHERE source_table='seabird_sbe37') <> 1 OR (SELECT salinity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') <> 31 THEN RAISE EXCEPTION 'rollback was partial'; END IF; END $$;
 ROLLBACK;

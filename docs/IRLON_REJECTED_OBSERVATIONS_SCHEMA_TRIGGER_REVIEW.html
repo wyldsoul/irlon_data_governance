@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IRLON Rejected Observations — Schema &amp; Trigger Architecture Review</title>
+  <style>
+    :root { --ink:#1b2733; --muted:#607080; --line:#d8e0e7; --paper:#fff; --wash:#f5f8fa; --blue:#116b9f; --bluewash:#eaf5fb; --green:#19724a; --greenwash:#eaf7ef; --amber:#9a5b00; --amberwash:#fff5e6; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--wash); color:var(--ink); font:15px/1.52 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; }
+    main { max-width:1120px; margin:0 auto; padding:30px 26px 44px; }
+    header { background:linear-gradient(135deg,#12364c,#176b98); color:#fff; border-radius:14px; padding:30px 34px; box-shadow:0 6px 20px #17364c22; }
+    h1 { margin:0 0 7px; font-size:30px; line-height:1.18; letter-spacing:-.4px; }
+    h2 { margin:30px 0 10px; font-size:20px; letter-spacing:-.15px; }
+    h3 { margin:0 0 8px; font-size:16px; }
+    p { margin:8px 0; }
+    .subtitle { margin:0; max-width:780px; opacity:.92; font-size:16px; }
+    .badge { display:inline-block; margin-top:17px; padding:5px 10px; border-radius:999px; background:#fff2; border:1px solid #ffffff66; font-weight:650; font-size:13px; }
+    .lead, .panel, .card, .questions { background:var(--paper); border:1px solid var(--line); border-radius:11px; padding:18px 20px; }
+    .lead { margin-top:20px; border-left:5px solid var(--blue); }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+    .card { min-height:220px; }
+    .muted { color:var(--muted); }
+    code { font:13px/1.35 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; background:#f0f4f7; padding:1px 4px; border-radius:4px; }
+    pre { margin:10px 0 0; padding:12px 14px; overflow:auto; border-radius:8px; background:#172633; color:#eaf2f7; font:12.5px/1.45 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; }
+    table { width:100%; border-collapse:separate; border-spacing:0; border:1px solid var(--line); border-radius:9px; overflow:hidden; font-size:13px; }
+    th { background:#eaf1f5; color:#364653; text-align:left; font-weight:700; }
+    th, td { padding:8px 10px; vertical-align:top; border-bottom:1px solid var(--line); }
+    tr:last-child td { border-bottom:0; }
+    td:first-child { width:27%; white-space:nowrap; font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:12px; }
+    .qc { background:var(--greenwash); border:1px solid #bfe0cb; border-left:5px solid var(--green); border-radius:10px; padding:15px 18px; }
+    .qc strong { color:#155f3e; }
+    .architecture { display:grid; grid-template-columns:1fr 42px 1.35fr; align-items:center; gap:9px; margin:10px 0; }
+    .registry { padding:16px; text-align:center; border-radius:10px; background:var(--bluewash); border:1px solid #b9dceb; color:#075a88; font-weight:700; }
+    .arrow { text-align:center; color:var(--blue); font-size:28px; }
+    .modules { display:grid; gap:7px; }
+    .module { padding:8px 11px; border:1px solid var(--line); border-radius:7px; background:#fff; }
+    .implemented { border-color:#9bd2b6; background:var(--greenwash); }
+    .tag { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:99px; font-size:11px; font-weight:700; background:#dfe7ed; color:#536370; }
+    .tag.live { background:#ccebd9; color:#176b45; }
+    .questions { background:var(--amberwash); border-color:#f0d39c; }
+    .questions ol { margin:8px 0 0 22px; padding:0; }
+    .questions li { margin:7px 0; }
+    .foot { margin-top:20px; color:var(--muted); font-size:12px; }
+    @media (max-width:720px) { main { padding:18px 14px 30px; } header { padding:24px 22px; } .grid { grid-template-columns:1fr; } .architecture { grid-template-columns:1fr; } .arrow { transform:rotate(90deg); } td:first-child { white-space:normal; width:34%; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>IRLON Rejected Observations<br>Schema &amp; Trigger Architecture Review</h1>
+    <p class="subtitle">Technical/design review of a generic public-parameter rejection registry and its first concrete SBE37 enforcement module.</p>
+    <span class="badge">Pilot / design review — not deployed to production</span>
+  </header>
+
+  <section class="lead">
+    <h2 style="margin-top:0">Purpose</h2>
+    <p>A deliberate rejection makes the affected <strong>public parameter value NULL</strong>; it does not delete or NULL the private/raw observation. The central registry records why the public parameter was suppressed, including the applicable QC rollup and audit metadata. Active records prevent later ingestion or replay from silently restoring that rejected value. Suppression is parameter-level, not whole-row deletion.</p>
+  </section>
+
+  <section>
+    <h2>1. Generic IRLON governance registry</h2>
+    <p class="muted">The registry is intended for all governed IRLON public tables. The fields below are the current <code>rejected_observations</code> schema.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td>rejection_id</td><td>Generated primary-key audit identifier.</td></tr>
+        <tr><td>source_table / public_table</td><td>Logical source and public target tables for the decision.</td></tr>
+        <tr><td>source_station / public_station</td><td>Source and public station identities; they may use different naming conventions.</td></tr>
+        <tr><td>instrument_type</td><td>Instrument-family discriminator used by a concrete enforcement module.</td></tr>
+        <tr><td>instrument_serial</td><td>Required instrument identity, distinct from source-table-specific column names. A temporarily missing source serial must be resolved from approved source or deployment history, or fail closed.</td></tr>
+        <tr><td>m_date</td><td>Exact observation timestamp.</td></tr>
+        <tr><td>public_parameter</td><td>The single public parameter to suppress.</td></tr>
+        <tr><td>qc_flag</td><td>Applicable IRLON QARTOD rollup to retain with the NULL public value.</td></tr>
+        <tr><td>rejection_reason</td><td>Human-readable reason for the deliberate suppression.</td></tr>
+        <tr><td>rejected_at / rejected_by</td><td>Decision audit timestamp and actor.</td></tr>
+        <tr><td>source_query_or_script</td><td>Optional provenance for the operation that created the decision.</td></tr>
+        <tr><td>active</td><td>Whether the decision currently suppresses replay/public writes.</td></tr>
+        <tr><td>reinstated_at / reinstated_by / reinstatement_reason</td><td>Audit trail when a rejection is explicitly made inactive.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>2. Active rejection identity and uniqueness</h2>
+    <p>Only <code>active</code> records participate in uniqueness, so a reinstated decision remains in history without blocking a later active decision. Every active identity includes its required instrument serial:</p>
+    <div class="panel">
+      <h3>Active rejection identity</h3>
+      <p><code>source_table</code>, <code>public_table</code>, <code>source_station</code>, <code>public_station</code>, <code>instrument_type</code>, <code>instrument_serial</code>, <code>m_date</code>, <code>public_parameter</code>.</p>
+      <p class="muted">A missing source serial is incomplete data, not a serial-less identity.</p>
+    </div>
+    <pre>CREATE UNIQUE INDEX rejected_observations_active_parameter_key
+ON rejected_observations
+  (source_table, public_table, source_station, public_station,
+   instrument_type, instrument_serial, m_date, public_parameter)
+WHERE active;</pre>
+  </section>
+
+  <section>
+    <h2>3. QC flag</h2>
+    <div class="qc">
+      <strong>IRLON QARTOD rollup convention</strong><br>
+      <code>1 = bad</code> &nbsp; <code>2 = suspect</code> &nbsp; <code>3 = good</code><br>
+      <span>The registry stores the applicable existing IRLON QARTOD rollup; it does not create a separate rejection-specific QC vocabulary.</span>
+      <pre>qc_flag integer NOT NULL CHECK (qc_flag IN (1, 2, 3))</pre>
+    </div>
+  </section>
+
+  <section>
+    <h2>4. Shared registry, table-specific enforcement</h2>
+    <div class="architecture">
+      <div class="registry">Generic<br><code>rejected_observations</code><br>registry</div>
+      <div class="arrow">→</div>
+      <div class="modules">
+        <div class="module implemented"><strong>SBE37 identity, mapping, and triggers</strong><span class="tag live">implemented pilot</span></div>
+        <div class="module">SeaFET enforcement module <span class="tag">future</span></div>
+        <div class="module">SUNA enforcement module <span class="tag">future</span></div>
+        <div class="module">Other public-table enforcement modules <span class="tag">future</span></div>
+      </div>
+    </div>
+    <p>Enforcement remains instrument/table-specific because source identity, private→public station mapping, valid public parameters, and replay/write behavior differ. The shared registry avoids repeating rejection/audit storage, while the implementation avoids one giant dynamic trigger that mutates arbitrary public columns.</p>
+  </section>
+
+  <section>
+    <h2>5. Current SBE37 trigger example</h2>
+    <div class="grid">
+      <article class="card">
+        <h3>Public write guard</h3>
+        <p><code>sbe37_guard_rejected_public_parameters</code><br><span class="muted">BEFORE INSERT OR UPDATE on <code>seabird_sbeeco</code></span></p>
+        <p>Runs through <code>sbe37_guard_public_parameter_write()</code> for the <code>SBE37/ECO</code> public path. It returns immediately when no active SBE37 rejection applies. Otherwise it requires transaction-local private identity, validates private station → public station mapping, and confirms the private station + <code>seabird_sbe37.serial_number_sbe37</code> + timestamp observation exists.</p>
+        <p>Matching rejected parameter(s) are forced to NULL and their paired public QC column receives the stored <code>qc_flag</code>. Missing, mismatched, or fabricated identity fails closed; unrelated parameters remain writable.</p>
+      </article>
+      <article class="card">
+        <h3>Private replay reapplication</h3>
+        <p><code>sbe37_reapply_rejected_public_parameters</code><br><span class="muted">AFTER INSERT OR UPDATE on <code>seabird_sbe37</code></span></p>
+        <p>Runs through <code>sbe37_reapply_rejections_after_private_write()</code>. It does nothing when no exact active SBE37 rejection exists. For a match, it re-applies NULL + stored QC suppression to the mapped public parameter(s).</p>
+        <p>It never NULLs or deletes private/raw SBE37 data.</p>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>6. Supporting SBE37 functions</h2>
+    <div class="panel">
+      <p><code>sbe37_public_station()</code> — private-to-public station mapping &nbsp; · &nbsp; <code>sbe37_set_public_write_identity()</code> — transaction-local identity context</p>
+      <p><code>sbe37_count_active_rejections()</code> — reporting lookup &nbsp; · &nbsp; <code>sbe37_apply_active_rejections()</code> — explicit NULL/QC application</p>
+      <p><code>reject_sbe37_public_parameter()</code> — transactional rejection API &nbsp; · &nbsp; <code>reinstate_sbe37_public_parameter()</code> — auditable deactivation</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>7. Questions for colleague confirmation</h2>
+    <div class="questions">
+      <ol>
+        <li>Does the generic registry have the correct identity and audit fields for use across IRLON public tables?</li>
+        <li>Does the serial-inclusive active-uniqueness model make sense for every active instrument?</li>
+        <li>Do you agree that <code>qc_flag</code> uses the established IRLON QARTOD vocabulary: 1 = bad, 2 = suspect, 3 = good?</li>
+        <li>Do you agree with one generic registry plus instrument/table-specific enforcement triggers?</li>
+        <li>Are there fields or constraints to change before additional enforcement modules are implemented?</li>
+      </ol>
+    </div>
+  </section>
+
+  <p class="foot">Scope: schema and trigger architecture review only. This document does not describe production deployment, writer integration steps, or enforcement for instruments other than the SBE37 pilot.</p>
+</main>
+</body>
+</html>
