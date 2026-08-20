@@ -55,14 +55,16 @@ BEGIN
   IF v_public_station IS NULL OR p_public_parameter <> 'ph_tempsal' THEN
     RAISE EXCEPTION 'unsupported SeaFET v1 identity or public parameter';
   END IF;
-  v_serial := seafetv1_resolve_serial(p_source_station, p_m_date);
-  IF v_serial IS NULL OR NULLIF(btrim(p_serial_number_seafet),'') IS DISTINCT FROM v_serial THEN
-    RAISE EXCEPTION 'SeaFET v1 source serial is missing, ambiguous, or does not match source identity';
+  IF NOT EXISTS (SELECT 1 FROM seabird_seafetv1 WHERE station=p_source_station AND m_date=p_m_date) THEN
+    RAISE EXCEPTION 'SeaFET v1 source observation not found';
   END IF;
+  v_serial := seafetv1_resolve_serial(p_source_station, p_m_date);
   INSERT INTO rejected_observations
-    (source_table,public_table,source_station,public_station,instrument_type,
+    (source_table,source_row_id,public_table,source_station,public_station,instrument_type,
      instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by,source_query_or_script)
-  VALUES ('seabird_seafetv1','seabird_seafetv1',p_source_station,v_public_station,'SeaFET v1',
+  VALUES ('seabird_seafetv1',
+          (SELECT row_id::bigint FROM seabird_seafetv1 WHERE station=p_source_station AND m_date=p_m_date),
+          'seabird_seafetv1',p_source_station,v_public_station,'SeaFET v1',
           v_serial,p_m_date,p_public_parameter,p_qc_flag,p_rejection_reason,p_rejected_by,p_source_query_or_script)
   RETURNING rejection_id INTO v_rejection_id;
   PERFORM seafetv1_apply_active_rejections(p_source_station,v_serial,p_m_date);
@@ -78,7 +80,7 @@ BEGIN
     FROM rejected_observations AS r
    WHERE r.active AND r.source_table='seabird_seafetv1' AND r.public_table='seabird_seafetv1'
      AND r.instrument_type='SeaFET v1' AND r.source_station=p_source_station
-     AND r.instrument_serial=p_serial AND r.m_date=p_m_date AND r.public_parameter='ph_tempsal'
+     AND r.m_date=p_m_date AND r.public_parameter='ph_tempsal'
      AND p.station=r.public_station AND p.m_date=r.m_date;
 END;
 $$;
@@ -93,7 +95,7 @@ BEGIN
          reinstated_by=p_reinstated_by, reinstatement_reason=p_reinstatement_reason
    WHERE active AND source_table='seabird_seafetv1' AND public_table='seabird_seafetv1'
      AND instrument_type='SeaFET v1' AND source_station=p_source_station
-     AND instrument_serial=p_serial_number_seafet AND m_date=p_m_date
+     AND m_date=p_m_date
      AND public_parameter=p_public_parameter;
   IF NOT FOUND THEN RAISE EXCEPTION 'active SeaFET v1 rejection not found'; END IF;
 END;
@@ -101,23 +103,15 @@ $$;
 
 CREATE FUNCTION seafetv1_guard_public_parameter_write()
 RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE v_source_station varchar; v_serial varchar; v_qc integer;
+DECLARE v_source_station varchar; v_qc integer;
 BEGIN
   IF NEW.station !~ '^.+-WQ$' THEN RETURN NEW; END IF;
   v_source_station := seafetv1_source_station(NEW.station);
-  v_serial := seafetv1_resolve_serial(v_source_station, NEW.m_date);
-  IF v_serial IS NULL THEN
-    IF EXISTS (SELECT 1 FROM rejected_observations WHERE active
-      AND source_table='seabird_seafetv1' AND public_table='seabird_seafetv1'
-      AND instrument_type='SeaFET v1' AND source_station=v_source_station
-      AND public_station=NEW.station AND m_date=NEW.m_date AND public_parameter='ph_tempsal') THEN
-      RAISE EXCEPTION 'cannot safely write SeaFET v1 public row: source serial unresolved';
-    END IF;
-    RETURN NEW;
-  END IF;
+  IF EXISTS (SELECT 1 FROM rejected_observations WHERE active AND source_table='seabird_seafetv1' AND public_table='seabird_seafetv1' AND instrument_type='SeaFET v1' AND source_station=v_source_station AND public_station=NEW.station AND m_date=NEW.m_date)
+     AND NOT EXISTS (SELECT 1 FROM seabird_seafetv1 WHERE station=v_source_station AND m_date=NEW.m_date) THEN RAISE EXCEPTION 'SeaFET v1 public write has no matching private observation'; END IF;
   SELECT qc_flag INTO v_qc FROM rejected_observations WHERE active
     AND source_table='seabird_seafetv1' AND public_table='seabird_seafetv1'
-    AND instrument_type='SeaFET v1' AND source_station=v_source_station AND instrument_serial=v_serial
+    AND instrument_type='SeaFET v1' AND source_station=v_source_station
     AND m_date=NEW.m_date AND public_parameter='ph_tempsal';
   IF FOUND THEN NEW.ph_tempsal := NULL; NEW.qc_ph_tempsal := v_qc; END IF;
   RETURN NEW;
@@ -126,15 +120,12 @@ $$;
 
 CREATE FUNCTION seafetv1_reapply_rejections_after_private_write()
 RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE v_serial varchar;
 BEGIN
   IF NEW.station !~ '^_.+_SEAFETV1$' THEN RETURN NEW; END IF;
-  v_serial := seafetv1_resolve_serial(NEW.station, NEW.m_date);
-  IF v_serial IS NULL THEN RETURN NEW; END IF;
   IF EXISTS (SELECT 1 FROM rejected_observations WHERE active AND source_table='seabird_seafetv1'
        AND public_table='seabird_seafetv1' AND instrument_type='SeaFET v1'
-       AND source_station=NEW.station AND instrument_serial=v_serial AND m_date=NEW.m_date) THEN
-    PERFORM seafetv1_apply_active_rejections(NEW.station,v_serial,NEW.m_date);
+       AND source_station=NEW.station AND m_date=NEW.m_date) THEN
+    PERFORM seafetv1_apply_active_rejections(NEW.station,NULL,NEW.m_date);
   END IF;
   RETURN NEW;
 END;

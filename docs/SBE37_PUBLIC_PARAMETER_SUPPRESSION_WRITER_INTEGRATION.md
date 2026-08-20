@@ -10,7 +10,7 @@ This is a reviewed patch plan, not an edit to either live writer. Both files are
 
 The recurring writer (`R/sbe37_ascii_process_recurring_final.R`, public loop around line 2490) and manual writer (`R/manual_sbe37_ascii_process_recurring_final.R`, public loop around line 1099) have the same shape: they calculate `newdata` with `serial_number_sbe37`, build public/private payloads, then currently upsert every public row before every private row. That order is incompatible with evidence-based public identity validation.
 
-The minimal safe integration is, per row, **private upsert first**, followed by one public SQL statement that both establishes identity and performs the public upsert. Preserve `serial_number_sbe37` as a payload field in both data frames.
+The minimal safe integration is, per row, **private upsert first**, followed by the public upsert. The trigger derives source identity from the mapped private station and timestamp. Preserve `serial_number_sbe37` as provenance when the writer has it, but do not make it a public-write prerequisite.
 
 ```r
 WITH identity AS MATERIALIZED (
@@ -29,11 +29,10 @@ SELECT n FROM suppression CROSS JOIN upsert;
 
 The `CROSS JOIN identity` is required: it makes the materialized identity CTE execute in the same statement/transaction as the guarded upsert. Read the returned `n` and add it to the run total. This produces `N rejected public parameter values suppressed` without relying on session context surviving autocommit. A separate `set identity; then upsert` sequence is unsafe and must not be used.
 
-The private payload/upsert in both writers must also include `serial_number_sbe37`. At present it is calculated in `newdata` but omitted from both the `private <- select(...)` list and the `INSERT INTO seabird_sbe37` column/value/update lists. Add it to the private payload and the private `INSERT` column/value/`ON CONFLICT DO UPDATE` assignment. Without it, a future replay cannot be tied to the instrument serial. This is required before enabling the database trigger.
+The private payload/upsert should include `serial_number_sbe37` whenever the writer has it, preserving provenance for manual ASCII and complete real-time rows. Its absence must not prevent a replay from being tied to the unique source observation.
 
-Every active rejection identity requires that serial. If an hourly observation is
-temporarily missing `serial_number_sbe37`, do not create or apply a serial-less
-rejection identity; resolve the serial from an approved source or deployment
-history first, or fail closed.
+For SBE37, active rejection identity is the unique source observation. If an
+hourly observation omits `serial_number_sbe37`, retain the raw blank and apply
+the rejection using source station, timestamp, and public parameter.
 
 Do not infer the serial from `_IRL-…_SBE37`: that station string contains no serial number. Do not set a session-wide context once at process startup: each row may have a different serial.

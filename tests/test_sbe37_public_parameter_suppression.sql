@@ -9,13 +9,13 @@ CREATE TABLE seabird_sbeeco (
   depth_instrument double precision, qc_depth_instrument integer, oxygen_saturation_perc double precision, qc_oxygen_saturation_perc integer,
   dissolved_oxygen double precision, qc_dissolved_oxygen integer, specific_conductance double precision, qc_specific_conductance integer,
   UNIQUE (station, m_date));
-CREATE TABLE seabird_sbe37 (station varchar NOT NULL, m_date timestamptz NOT NULL, serial_number_sbe37 varchar, raw_conductivity_hz double precision, UNIQUE(station,m_date));
+CREATE TABLE seabird_sbe37 (station varchar NOT NULL, m_date timestamptz NOT NULL, serial_number_sbe37 varchar, raw_conductivity_hz double precision, row_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, UNIQUE(station,m_date));
 CREATE TABLE seabird_seafetv1 (station varchar NOT NULL, m_date timestamptz NOT NULL, serial_number_seafet varchar,
-  ph_tempsal double precision, qc_ph_tempsal integer, ph_int double precision, UNIQUE(station,m_date));
+  ph_tempsal double precision, qc_ph_tempsal integer, ph_int double precision, row_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, UNIQUE(station,m_date));
 CREATE TABLE seabird_sunav2 (station varchar NOT NULL, m_date timestamptz NOT NULL, serial_number_suna varchar,
-  nitrate_um double precision, qc_nitrate_um integer, nitrate_mgl double precision, qc_nitrate_mgl integer, UNIQUE(station,m_date));
+  nitrate_um double precision, qc_nitrate_um integer, nitrate_mgl double precision, qc_nitrate_mgl integer, row_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, UNIQUE(station,m_date));
 CREATE TABLE nortek_aquadopp (station varchar NOT NULL, m_date timestamptz NOT NULL, serial_number_aquadopp varchar,
-  current_speed double precision, qc_current_speed integer, current_direction double precision, qc_current_direction integer, UNIQUE(station,m_date));
+  current_speed double precision, qc_current_speed integer, current_direction double precision, qc_current_direction integer, row_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, UNIQUE(station,m_date));
 \ir ../sql/sbe37_public_parameter_suppression.sql
 \ir ../sql/seafetv1/public_parameter_suppression.sql
 \ir ../sql/sunav2/public_parameter_suppression.sql
@@ -47,23 +47,22 @@ DO $$ BEGIN
  IF sbe37_count_active_rejections('_IRL-SB_SBE37','25799','2026-01-01 00:00+00') <> 1 THEN RAISE EXCEPTION 'suppression reporting count failed'; END IF;
 END $$;
 
--- The generic registry enforces active uniqueness for serial-bearing sources.
+-- Active uniqueness is source-observation identity, not serial provenance.
 DO $$ DECLARE v_inserted boolean := false; BEGIN
  BEGIN
    INSERT INTO rejected_observations
-     (source_table,public_table,source_station,public_station,instrument_type,
+     (source_table,source_row_id,public_table,source_station,public_station,instrument_type,
       instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
    VALUES
-     ('seabird_sbe37','seabird_sbeeco','_IRL-SB_SBE37','IRL-SB-WQ','SBE37',
+     ('seabird_sbe37',(SELECT row_id FROM seabird_sbe37 WHERE station='_IRL-SB_SBE37' AND m_date='2026-01-01 00:00+00'),'seabird_sbeeco','_IRL-SB_SBE37','IRL-SB-WQ','SBE37',
       '25799','2026-01-01 00:00+00','conductivity',2,'duplicate test','tester');
    v_inserted := true;
  EXCEPTION WHEN unique_violation THEN NULL;
  END;
- IF v_inserted THEN RAISE EXCEPTION 'active serial rejection duplicate was accepted'; END IF;
+ IF v_inserted THEN RAISE EXCEPTION 'active source-observation rejection duplicate was accepted'; END IF;
 END $$;
 
--- The generic registry needs no SBE37-specific schema values or parameter list,
--- but every active instrument identity carries its serial number.
+-- Provenance serial may be NULL without creating a second identity.
 INSERT INTO rejected_observations
   (source_table,public_table,source_station,public_station,instrument_type,
    instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
@@ -101,22 +100,9 @@ DO $$ BEGIN
  END IF;
 END $$;
 
--- A source row without its serial is incomplete; it cannot create a separate,
--- serial-less rejection identity.
-DO $$ DECLARE v_inserted boolean := false; BEGIN
- BEGIN
-   INSERT INTO rejected_observations
-     (source_table,public_table,source_station,public_station,instrument_type,
-      instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
-   VALUES
-     ('missing_serial_fixture','fixture_public','IRL-MISS-SRC','IRL-MISS-PUB',
-      'Fixture',NULL,'2026-01-01 00:00+00','fixture_parameter',2,
-      'missing serial test','tester');
-   v_inserted := true;
- EXCEPTION WHEN not_null_violation THEN NULL;
- END;
- IF v_inserted THEN RAISE EXCEPTION 'missing instrument serial was accepted'; END IF;
-END $$;
+INSERT INTO rejected_observations
+  (source_table,public_table,source_station,public_station,instrument_type,instrument_serial,m_date,public_parameter,qc_flag,rejection_reason,rejected_by)
+VALUES ('missing_serial_fixture','fixture_public','IRL-MISS-SRC','IRL-MISS-PUB','Fixture',NULL,'2026-01-01 00:00+00','fixture_parameter',2,'missing serial provenance test','tester');
 
 -- qc_flag is the established IRLON QARTOD rollup, not a rejection category:
 -- 1 = bad, 2 = suspect, 3 = good. All three values are accepted.
@@ -169,7 +155,7 @@ DO $$ DECLARE v_inserted boolean := false; BEGIN
  IF v_inserted THEN RAISE EXCEPTION 'qc_flag NULL was accepted'; END IF;
 END $$;
 
--- A public-only/manual SQL attempt with no private identity fails closed.
+-- The guard derives the unique mapped private source row; no serial context is needed.
 RESET irlon.sbe37_source_station;
 RESET irlon.sbe37_serial_number;
 DO $$ DECLARE v_allowed boolean := false; BEGIN
@@ -178,12 +164,10 @@ DO $$ DECLARE v_allowed boolean := false; BEGIN
    v_allowed := true;
  EXCEPTION WHEN SQLSTATE 'P0001' THEN NULL;
  END;
- IF v_allowed THEN RAISE EXCEPTION 'missing identity unexpectedly allowed'; END IF;
- IF (SELECT conductivity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') IS NOT NULL THEN RAISE EXCEPTION 'identity-less bypass repopulated value'; END IF;
+ IF NOT v_allowed OR (SELECT conductivity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') IS NOT NULL THEN RAISE EXCEPTION 'context-free source identity failed'; END IF;
 END $$;
 
--- Unrelated private station, fabricated serial, and absent private timestamp
--- cannot authorize the active-rejection public row.
+-- Serial context is ignored; the mapped source station/timestamp is authoritative.
 DO $$ DECLARE v_allowed boolean; BEGIN
  v_allowed := false;
  BEGIN
@@ -192,7 +176,7 @@ DO $$ DECLARE v_allowed boolean; BEGIN
    v_allowed := true;
  EXCEPTION WHEN SQLSTATE 'P0001' THEN NULL;
  END;
- IF v_allowed THEN RAISE EXCEPTION 'unrelated station unexpectedly allowed'; END IF;
+ IF NOT v_allowed THEN RAISE EXCEPTION 'unrelated serial context changed source identity'; END IF;
  v_allowed := false;
  BEGIN
    PERFORM sbe37_set_public_write_identity('_IRL-SB_SBE37','fabricated');
@@ -200,7 +184,7 @@ DO $$ DECLARE v_allowed boolean; BEGIN
    v_allowed := true;
  EXCEPTION WHEN SQLSTATE 'P0001' THEN NULL;
  END;
- IF v_allowed THEN RAISE EXCEPTION 'fabricated serial unexpectedly allowed'; END IF;
+ IF NOT v_allowed THEN RAISE EXCEPTION 'fabricated serial context changed source identity'; END IF;
 END $$;
 SAVEPOINT missing_private_timestamp;
 UPDATE seabird_sbe37 SET m_date='2026-01-01 01:00+00';
@@ -241,8 +225,8 @@ DO $$ DECLARE v_allowed boolean := false; BEGIN
    v_allowed := true;
  EXCEPTION WHEN SQLSTATE 'P0001' THEN NULL;
  END;
- IF v_allowed OR (SELECT conductivity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') IS NOT NULL THEN
-   RAISE EXCEPTION 'identity leaked into later public write';
+ IF NOT v_allowed OR (SELECT conductivity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') IS NOT NULL THEN
+   RAISE EXCEPTION 'later public replay was not source-observation suppressed';
  END IF;
 END $$;
 
@@ -275,7 +259,7 @@ WITH identity AS MATERIALIZED (
 INSERT INTO seabird_sbeeco (station, m_date, instrument, conductivity)
 SELECT c.station, c.m_date, c.instrument, c.conductivity FROM candidate c CROSS JOIN identity
 ON CONFLICT (station, m_date) DO UPDATE SET instrument=EXCLUDED.instrument, conductivity=EXCLUDED.conductivity;
-DO $$ BEGIN IF (SELECT conductivity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') <> 8 THEN RAISE EXCEPTION 'different serial was suppressed'; END IF; END $$;
+DO $$ BEGIN IF (SELECT conductivity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') IS NOT NULL THEN RAISE EXCEPTION 'serial correction created a second identity'; END IF; END $$;
 
 -- A legacy/private-only upsert cannot repopulate public data; its AFTER trigger re-nulls it.
 UPDATE seabird_sbe37 SET raw_conductivity_hz=7100, serial_number_sbe37='25799' WHERE station='_IRL-SB_SBE37' AND m_date='2026-01-01 00:00+00';
@@ -297,8 +281,8 @@ DO $$ DECLARE v_before double precision; v_allowed boolean := false; BEGIN
    v_allowed := true;
  EXCEPTION WHEN SQLSTATE 'P0001' THEN NULL;
  END;
- IF v_allowed THEN RAISE EXCEPTION 'mismatched single statement unexpectedly allowed'; END IF;
- IF (SELECT salinity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') IS DISTINCT FROM v_before THEN RAISE EXCEPTION 'failed statement was partial'; END IF;
+ IF NOT v_allowed THEN RAISE EXCEPTION 'serial context unexpectedly blocked source-observation write'; END IF;
+ IF (SELECT salinity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') <> 99 THEN RAISE EXCEPTION 'unrelated parameter changed unexpectedly'; END IF;
 END $$;
 
 -- Reinstatement is audited and permits a future write; it does not reconstruct history.
@@ -311,7 +295,7 @@ DO $$ BEGIN IF (SELECT conductivity FROM seabird_sbeeco WHERE station='IRL-SB-WQ
 SAVEPOINT rejection_rollback;
 SELECT reject_sbe37_public_parameter('_IRL-SB_SBE37','25799','2026-01-01 00:00+00','salinity',1,'rollback','tester');
 ROLLBACK TO rejection_rollback;
-DO $$ BEGIN IF (SELECT count(*) FROM rejected_observations WHERE source_table='seabird_sbe37') <> 1 OR (SELECT salinity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') <> 31 THEN RAISE EXCEPTION 'rollback was partial'; END IF; END $$;
+DO $$ BEGIN IF (SELECT count(*) FROM rejected_observations WHERE source_table='seabird_sbe37') <> 1 OR (SELECT salinity FROM seabird_sbeeco WHERE station='IRL-SB-WQ') <> 99 THEN RAISE EXCEPTION 'rollback was partial'; END IF; END $$;
 
 -- Additional modules: source-specific fixed parameter handling, raw preservation,
 -- replay, serial mismatch rejection, and audited reinstatement.
@@ -329,7 +313,8 @@ INSERT INTO seabird_sunav2 VALUES ('_IRL-SF_SUNA','2026-02-01 00:00+00','SU-1',N
 SELECT reject_sunav2_public_parameter('_IRL-SF_SUNA','SU-1','2026-02-01 00:00+00','nitrate_um',2,'test','tester');
 UPDATE seabird_sunav2 SET nitrate_um=11,qc_nitrate_um=3,nitrate_mgl=2.1 WHERE station='IRL-SF-WQ' AND m_date='2026-02-01 00:00+00';
 DO $$ BEGIN IF (SELECT nitrate_um FROM seabird_sunav2 WHERE station='IRL-SF-WQ') IS NOT NULL OR (SELECT qc_nitrate_um FROM seabird_sunav2 WHERE station='IRL-SF-WQ')<>2 OR (SELECT nitrate_mgl FROM seabird_sunav2 WHERE station='IRL-SF-WQ')<>2.1 THEN RAISE EXCEPTION 'SUNA fixed-parameter guard failed'; END IF; END $$;
-DO $$ DECLARE ok boolean:=false; BEGIN BEGIN PERFORM reject_sunav2_public_parameter('_IRL-SF_SUNA','fabricated','2026-02-01 00:00+00','nitrate_mgl',3,'test','tester'); ok:=true; EXCEPTION WHEN others THEN NULL; END; IF ok THEN RAISE EXCEPTION 'SUNA fabricated serial accepted'; END IF; END $$;
+SELECT reject_sunav2_public_parameter('_IRL-SF_SUNA','fabricated','2026-02-01 00:00+00','nitrate_mgl',3,'test','tester');
+DO $$ BEGIN IF (SELECT instrument_serial FROM rejected_observations WHERE source_table='seabird_sunav2' AND public_parameter='nitrate_mgl') <> 'SU-1' THEN RAISE EXCEPTION 'SUNA serial provenance was not taken from source row'; END IF; END $$;
 DO $$ DECLARE ok boolean:=false; BEGIN BEGIN PERFORM reject_sunav2_public_parameter('_IRL-SF_SUNA','SU-1','2026-02-01 00:00+00','fit_rmse',1,'test','tester'); ok:=true; EXCEPTION WHEN others THEN NULL; END; IF ok THEN RAISE EXCEPTION 'SUNA unsupported parameter accepted'; END IF; END $$;
 
 -- SUNA's real writer uses separate autocommit statements: private first, then
@@ -370,4 +355,81 @@ DO $$ DECLARE ok boolean:=false; BEGIN BEGIN PERFORM reject_aquadopp_public_para
 -- only when both adjacent source observations agree.
 INSERT INTO seabird_seafetv1 VALUES ('_IRL-GAP_SEAFETV1','2026-02-01 00:00+00','GAP-1',NULL,NULL,7),('_IRL-GAP_SEAFETV1','2026-02-01 01:00+00',NULL,NULL,NULL,7),('_IRL-GAP_SEAFETV1','2026-02-01 02:00+00','GAP-1',NULL,NULL,7),('IRL-GAP-WQ','2026-02-01 01:00+00',NULL,8,3,NULL);
 DO $$ BEGIN IF seafetv1_resolve_serial('_IRL-GAP_SEAFETV1','2026-02-01 01:00+00') <> 'GAP-1' THEN RAISE EXCEPTION 'SeaFET bounded serial recovery failed'; END IF; END $$;
+
+-- Derived-parameter governance: SBE37 water temperature is the parent input
+-- to SBE37 salinity/dissolved oxygen and, where a matching private SeaFET row
+-- exists, to SeaFET pH.  All children use the parent's QARTOD rollup and have
+-- their own immutable source-table/row_id provenance.
+INSERT INTO seabird_sbeeco VALUES ('IRL-DER-WQ','2026-03-01 00:00+00','SBE37/ECO',4,3,30,3,20,3,1,3,1,3,90,3,8,3,4000,3);
+INSERT INTO seabird_sbe37 (station,m_date,serial_number_sbe37,raw_conductivity_hz)
+  VALUES ('_IRL-DER_SBE37','2026-03-01 00:00+00',NULL,4000);
+INSERT INTO seabird_seafetv1 (station,m_date,serial_number_seafet,ph_tempsal,qc_ph_tempsal,ph_int)
+  VALUES ('_IRL-DER_SEAFETV1','2026-03-01 00:00+00',NULL,NULL,NULL,7.9),
+         ('IRL-DER-WQ','2026-03-01 00:00+00',NULL,8.1,3,NULL);
+SELECT reject_sbe37_public_parameter('_IRL-DER_SBE37',NULL,'2026-03-01 00:00+00','temperature_water',1,'bad source temperature','tester','derived test');
+DO $$
+DECLARE v_parent bigint := (SELECT rejection_id FROM rejected_observations
+  WHERE source_table='seabird_sbe37' AND source_station='_IRL-DER_SBE37'
+    AND m_date='2026-03-01 00:00+00' AND public_parameter='temperature_water' AND active);
+BEGIN
+ IF (SELECT temperature_water FROM seabird_sbeeco WHERE station='IRL-DER-WQ') IS NOT NULL
+    OR (SELECT qc_temperature_water FROM seabird_sbeeco WHERE station='IRL-DER-WQ') <> 1
+    OR (SELECT salinity FROM seabird_sbeeco WHERE station='IRL-DER-WQ') IS NOT NULL
+    OR (SELECT qc_salinity FROM seabird_sbeeco WHERE station='IRL-DER-WQ') <> 1
+    OR (SELECT dissolved_oxygen FROM seabird_sbeeco WHERE station='IRL-DER-WQ') IS NOT NULL
+    OR (SELECT qc_dissolved_oxygen FROM seabird_sbeeco WHERE station='IRL-DER-WQ') <> 1
+    OR (SELECT ph_tempsal FROM seabird_seafetv1 WHERE station='IRL-DER-WQ') IS NOT NULL
+    OR (SELECT qc_ph_tempsal FROM seabird_seafetv1 WHERE station='IRL-DER-WQ') <> 1 THEN
+   RAISE EXCEPTION 'temperature dependency suppression/QARTOD propagation failed';
+ END IF;
+ IF (SELECT count(*) FROM rejected_observations WHERE parent_rejection_id=v_parent AND active) <> 3 THEN
+   RAISE EXCEPTION 'expected SBE37 salinity, dissolved oxygen, and SeaFET pH children';
+ END IF;
+ IF EXISTS (
+   SELECT 1 FROM rejected_observations r LEFT JOIN seabird_sbe37 s
+     ON r.source_table='seabird_sbe37' AND r.source_row_id=s.row_id
+    WHERE r.rejection_id=v_parent AND (r.source_row_id IS NULL OR s.row_id IS NULL)
+ ) THEN RAISE EXCEPTION 'SBE37 parent did not record its immutable source row'; END IF;
+ IF EXISTS (
+   SELECT 1 FROM rejected_observations r LEFT JOIN seabird_seafetv1 sf
+     ON r.source_table='seabird_seafetv1' AND r.source_row_id=sf.row_id
+    WHERE r.parent_rejection_id=v_parent AND r.source_table='seabird_seafetv1'
+      AND (r.source_row_id IS NULL OR sf.row_id IS NULL)
+ ) THEN RAISE EXCEPTION 'SeaFET child did not record its immutable source row'; END IF;
+END $$;
+SELECT reinstate_sbe37_public_parameter(
+  (SELECT rejection_id FROM rejected_observations WHERE source_table='seabird_sbe37'
+    AND source_station='_IRL-DER_SBE37' AND m_date='2026-03-01 00:00+00'
+    AND public_parameter='temperature_water' AND active), 'reviewer','parent reinstated');
+DO $$
+DECLARE v_parent bigint := (SELECT rejection_id FROM rejected_observations
+  WHERE source_table='seabird_sbe37' AND source_station='_IRL-DER_SBE37'
+    AND m_date='2026-03-01 00:00+00' AND public_parameter='temperature_water');
+BEGIN
+ IF EXISTS (SELECT 1 FROM rejected_observations WHERE (rejection_id=v_parent OR parent_rejection_id=v_parent) AND active) THEN
+   RAISE EXCEPTION 'parent reinstatement did not deactivate its derived children';
+ END IF;
+ UPDATE seabird_sbeeco SET temperature_water=21,salinity=31,dissolved_oxygen=9 WHERE station='IRL-DER-WQ';
+ UPDATE seabird_seafetv1 SET ph_tempsal=8.2,qc_ph_tempsal=3 WHERE station='IRL-DER-WQ';
+ IF (SELECT temperature_water FROM seabird_sbeeco WHERE station='IRL-DER-WQ') <> 21
+    OR (SELECT salinity FROM seabird_sbeeco WHERE station='IRL-DER-WQ') <> 31
+    OR (SELECT dissolved_oxygen FROM seabird_sbeeco WHERE station='IRL-DER-WQ') <> 9
+    OR (SELECT ph_tempsal FROM seabird_seafetv1 WHERE station='IRL-DER-WQ') <> 8.2 THEN
+   RAISE EXCEPTION 'reinstated parent still blocked normal replay';
+ END IF;
+END $$;
+
+-- Option 1: no matching SeaFET source row must not prevent the SBE37 parent
+-- and its same-row SBE37 children from being recorded and enforced.
+INSERT INTO seabird_sbeeco VALUES ('IRL-NOPH-WQ','2026-03-01 01:00+00','SBE37/ECO',4,3,30,3,20,3,1,3,1,3,90,3,8,3,4000,3);
+INSERT INTO seabird_sbe37 (station,m_date,serial_number_sbe37,raw_conductivity_hz)
+  VALUES ('_IRL-NOPH_SBE37','2026-03-01 01:00+00',NULL,4000);
+SELECT reject_sbe37_public_parameter('_IRL-NOPH_SBE37',NULL,'2026-03-01 01:00+00','temperature_water',2,'no SeaFET source','tester');
+DO $$ DECLARE v_parent bigint := (SELECT rejection_id FROM rejected_observations
+  WHERE source_table='seabird_sbe37' AND source_station='_IRL-NOPH_SBE37'
+    AND m_date='2026-03-01 01:00+00' AND public_parameter='temperature_water' AND active); BEGIN
+ IF (SELECT count(*) FROM rejected_observations WHERE parent_rejection_id=v_parent AND active) <> 2 THEN
+   RAISE EXCEPTION 'missing SeaFET source should leave only the two SBE37 derived children';
+ END IF;
+END $$;
 ROLLBACK;
