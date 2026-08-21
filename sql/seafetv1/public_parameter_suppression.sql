@@ -2,13 +2,13 @@
 -- The physical table is shared: underscore-prefixed stations are private/raw
 -- SeaFET rows and the corresponding -WQ station is the public row.
 
-CREATE FUNCTION seafetv1_public_station(p_source_station varchar)
+CREATE OR REPLACE FUNCTION seafetv1_public_station(p_source_station varchar)
 RETURNS varchar LANGUAGE sql IMMUTABLE STRICT AS $$
   SELECT CASE WHEN p_source_station ~ '^_.+_SEAFETV1$'
               THEN regexp_replace(p_source_station, '^_(.+)_SEAFETV1$', E'\\1-WQ') END
 $$;
 
-CREATE FUNCTION seafetv1_source_station(p_public_station varchar)
+CREATE OR REPLACE FUNCTION seafetv1_source_station(p_public_station varchar)
 RETURNS varchar LANGUAGE sql IMMUTABLE STRICT AS $$
   SELECT CASE WHEN p_public_station ~ '^.+-WQ$'
               THEN '_' || regexp_replace(p_public_station, '-WQ$', '') || '_SEAFETV1' END
@@ -17,7 +17,7 @@ $$;
 -- Exact serial wins.  The only observed serial gap was 24 consecutive hourly
 -- rows at one station; resolve only when the nearest known serial on both sides
 -- is within 24 hours and agrees.  This cannot cross a serial transition.
-CREATE FUNCTION seafetv1_resolve_serial(p_source_station varchar, p_m_date timestamptz)
+CREATE OR REPLACE FUNCTION seafetv1_resolve_serial(p_source_station varchar, p_m_date timestamptz)
 RETURNS varchar LANGUAGE plpgsql STABLE AS $$
 DECLARE v_exact varchar; v_prior varchar; v_next varchar;
         v_prior_date timestamptz; v_next_date timestamptz;
@@ -44,7 +44,7 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION reject_seafetv1_public_parameter(
+CREATE OR REPLACE FUNCTION reject_seafetv1_public_parameter(
   p_source_station varchar, p_serial_number_seafet varchar, p_m_date timestamptz,
   p_public_parameter varchar, p_qc_flag integer, p_rejection_reason varchar,
   p_rejected_by varchar DEFAULT current_user, p_source_query_or_script text DEFAULT NULL)
@@ -72,9 +72,17 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION seafetv1_apply_active_rejections(p_source_station varchar, p_serial varchar, p_m_date timestamptz)
+CREATE OR REPLACE FUNCTION seafetv1_apply_active_rejections(p_source_station varchar, p_serial varchar, p_m_date timestamptz)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
+  IF EXISTS (
+    SELECT 1 FROM rejected_observations
+     WHERE active AND source_table='seabird_seafetv1' AND public_table='seabird_seafetv1'
+       AND instrument_type='SeaFET v1' AND source_station=p_source_station
+       AND m_date=p_m_date AND public_parameter <> 'ph_tempsal'
+  ) THEN
+    RAISE EXCEPTION 'unsupported active SeaFET v1 public parameter exists for % / %', p_source_station, p_m_date;
+  END IF;
   UPDATE seabird_seafetv1 AS p
      SET ph_tempsal = NULL, qc_ph_tempsal = r.qc_flag
     FROM rejected_observations AS r
@@ -85,28 +93,47 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION reinstate_seafetv1_public_parameter(
+CREATE OR REPLACE FUNCTION reinstate_seafetv1_public_parameter(
   p_source_station varchar, p_serial_number_seafet varchar, p_m_date timestamptz,
   p_public_parameter varchar, p_reinstated_by varchar DEFAULT current_user,
   p_reinstatement_reason varchar DEFAULT 'reinstated')
 RETURNS void LANGUAGE plpgsql AS $$
+DECLARE v_rejection_id bigint; v_parent_rejection_id bigint;
 BEGIN
+  SELECT rejection_id, parent_rejection_id
+    INTO v_rejection_id, v_parent_rejection_id
+    FROM rejected_observations
+   WHERE active AND source_table='seabird_seafetv1' AND public_table='seabird_seafetv1'
+     AND instrument_type='SeaFET v1' AND source_station=p_source_station
+     AND m_date=p_m_date AND public_parameter=p_public_parameter;
+  IF NOT FOUND THEN RAISE EXCEPTION 'active SeaFET v1 rejection not found'; END IF;
+  IF v_parent_rejection_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM rejected_observations
+     WHERE rejection_id=v_parent_rejection_id AND active
+  ) THEN
+    RAISE EXCEPTION 'cannot reinstate dependent rejection while parent rejection % remains active', v_parent_rejection_id;
+  END IF;
   UPDATE rejected_observations SET active=false, reinstated_at=now(),
          reinstated_by=p_reinstated_by, reinstatement_reason=p_reinstatement_reason
    WHERE active AND source_table='seabird_seafetv1' AND public_table='seabird_seafetv1'
      AND instrument_type='SeaFET v1' AND source_station=p_source_station
-     AND m_date=p_m_date
-     AND public_parameter=p_public_parameter;
-  IF NOT FOUND THEN RAISE EXCEPTION 'active SeaFET v1 rejection not found'; END IF;
+     AND m_date=p_m_date AND public_parameter=p_public_parameter;
 END;
 $$;
 
-CREATE FUNCTION seafetv1_guard_public_parameter_write()
+CREATE OR REPLACE FUNCTION seafetv1_guard_public_parameter_write()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE v_source_station varchar; v_qc integer;
 BEGIN
   IF NEW.station !~ '^.+-WQ$' THEN RETURN NEW; END IF;
   v_source_station := seafetv1_source_station(NEW.station);
+  IF EXISTS (SELECT 1 FROM rejected_observations WHERE active
+       AND source_table='seabird_seafetv1' AND public_table='seabird_seafetv1'
+       AND instrument_type='SeaFET v1' AND source_station=v_source_station
+       AND public_station=NEW.station AND m_date=NEW.m_date
+       AND public_parameter <> 'ph_tempsal') THEN
+    RAISE EXCEPTION 'unsupported active SeaFET v1 public parameter exists for % / %', v_source_station, NEW.m_date;
+  END IF;
   IF EXISTS (SELECT 1 FROM rejected_observations WHERE active AND source_table='seabird_seafetv1' AND public_table='seabird_seafetv1' AND instrument_type='SeaFET v1' AND source_station=v_source_station AND public_station=NEW.station AND m_date=NEW.m_date)
      AND NOT EXISTS (SELECT 1 FROM seabird_seafetv1 WHERE station=v_source_station AND m_date=NEW.m_date) THEN RAISE EXCEPTION 'SeaFET v1 public write has no matching private observation'; END IF;
   SELECT qc_flag INTO v_qc FROM rejected_observations WHERE active
@@ -118,7 +145,7 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION seafetv1_reapply_rejections_after_private_write()
+CREATE OR REPLACE FUNCTION seafetv1_reapply_rejections_after_private_write()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF NEW.station !~ '^_.+_SEAFETV1$' THEN RETURN NEW; END IF;
@@ -131,7 +158,9 @@ BEGIN
 END;
 $$;
 
+DROP TRIGGER IF EXISTS seafetv1_guard_rejected_public_parameters ON seabird_seafetv1;
 CREATE TRIGGER seafetv1_guard_rejected_public_parameters
 BEFORE INSERT OR UPDATE ON seabird_seafetv1 FOR EACH ROW EXECUTE FUNCTION seafetv1_guard_public_parameter_write();
+DROP TRIGGER IF EXISTS seafetv1_reapply_rejected_public_parameters ON seabird_seafetv1;
 CREATE TRIGGER seafetv1_reapply_rejected_public_parameters
 AFTER INSERT OR UPDATE ON seabird_seafetv1 FOR EACH ROW EXECUTE FUNCTION seafetv1_reapply_rejections_after_private_write();

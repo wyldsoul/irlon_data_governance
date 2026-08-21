@@ -27,13 +27,23 @@ multiple source observations.
 ## Derived parameters
 
 An active rejection can have auditable child decisions through
-`parent_rejection_id`. The first implemented rule is SBE37
-`temperature_water` → SBE37 `salinity` and `dissolved_oxygen`; when a matched
-private SeaFET observation exists at the same public station/time, it also
-creates SeaFET `ph_tempsal`. Children retain their own source table/row ID and
-receive the parent QARTOD flag. No SeaFET observation means no SeaFET child and
-does not block the SBE37 parent. Reinstating the parent deactivates only its
-linked children; it never reconstructs historical public values.
+`parent_rejection_id`, evidenced against the production writers rather than
+inferred from scientific convention. The implemented SBE37 rules are:
+`temperature_water` → SBE37 `salinity` and `dissolved_oxygen`; `salinity` →
+SeaFET `ph_tempsal` (when a matched private SeaFET observation exists at the
+same public station/time); and `pressure_water` → `depth_instrument`. A chain
+never has more than one parent per row: `ph_tempsal` reached via a
+`temperature_water` rejection is parented to the `salinity` child that
+rejection created, not to `temperature_water` directly, so it always has a
+single provenance path (`temperature_water` → `salinity` → `ph_tempsal`).
+Children retain their own source table/row ID and receive the parent QARTOD
+flag. No SeaFET observation means no SeaFET child and does not block the
+SBE37/salinity parent. Reinstating a rejection deactivates its full active
+descendant subtree, however many levels deep, in one call; it never
+reconstructs historical public values. A dependent's "cannot reinstate while
+parent is active" check only needs to examine its immediate parent, not the
+full ancestor chain: a row can never be active while its own direct parent is
+active, an invariant the full-subtree cascade on reinstatement maintains.
 
 No generic dynamic trigger mutates arbitrary table columns. Public-parameter
 validation and NULL/QC mutation remain explicit in each instrument/table module.
